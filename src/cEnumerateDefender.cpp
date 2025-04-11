@@ -3,15 +3,16 @@
 #include "headers/beacon.h"
 #include "headers/win32.h"
 
+// Updated namespace and query for modern Defender, works on both W10 and W11 with MDE and Standard Defender
 #define WQL                     L"WQL"
 #define WQLNAMESPACE            L"ROOT\\Microsoft\\Windows\\Defender"
-#define DEFENDER_WQL            L"Select * from MSFT_MpPreference"
+#define DEFENDER_WQL            L"SELECT * FROM MSFT_MpPreference"
 #define FOLDER_EXCLUSIONS       L"ExclusionPath"
 #define PROCESS_EXCLUSIONS      L"ExclusionProcess"
 #define EXTENSION_EXCLUSIONS    L"ExclusionExtension"
+#define IP_EXCLUSIONS           L"ExclusionIpAddress"
 
-
-static const wchar_t* options[] = { FOLDER_EXCLUSIONS, PROCESS_EXCLUSIONS, EXTENSION_EXCLUSIONS };
+static const wchar_t* options[] = { FOLDER_EXCLUSIONS, PROCESS_EXCLUSIONS, EXTENSION_EXCLUSIONS, IP_EXCLUSIONS };
 static unsigned short int step  = 1;
 
 extern "C" void dumpFormatAllocation(formatp* formatAllocationData)
@@ -43,7 +44,8 @@ extern "C" void go(char* argc, int len)
 
     HRESULT hres;
 
-    hres = OLE32$CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // Initialize COM
+    hres = OLE32$CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hres))
     {
         dumpFormatAllocation(&fpObject);
@@ -56,7 +58,7 @@ extern "C" void go(char* argc, int len)
         step++;
     }
 
-
+    // Set security levels
     hres = OLE32$CoInitializeSecurity(
         NULL,
         -1,                          
@@ -68,7 +70,6 @@ extern "C" void go(char* argc, int len)
         EOAC_NONE,                    
         NULL
     );
-
 
     if (FAILED(hres))
     {
@@ -88,6 +89,7 @@ extern "C" void go(char* argc, int len)
 
     IWbemLocator* pLoc = NULL;
 
+    // Create WMI locator
     hres = OLE32$CoCreateInstance(
         g_CLSID_WbemLocator,
         0,
@@ -129,6 +131,7 @@ extern "C" void go(char* argc, int len)
         step++;
     }
     
+    // Connect to WMI
     hres = pLoc->ConnectServer(
         bstrDefenderRootWMI, 
         NULL,                    
@@ -148,7 +151,6 @@ extern "C" void go(char* argc, int len)
         BeaconPrintf(CALLBACK_ERROR, "[%02hu] Server connection to \"%S\" failed: %08x", step, (wchar_t*)WQLNAMESPACE, hres);
         
         // Cleanup
-        pSvc->Release();
         pLoc->Release();
         OLE32$CoUninitialize();
 
@@ -163,15 +165,16 @@ extern "C" void go(char* argc, int len)
         step++;
     }
 
+    // Set security levels on the proxy
     hres = OLE32$CoSetProxyBlanket(
         (IUnknown *)pSvc,
         RPC_C_AUTHN_WINNT,
         RPC_C_AUTHZ_NONE,
         NULL,
-        RPC_C_AUTHN_LEVEL_DEFAULT,      
+        RPC_C_AUTHN_LEVEL_CALL,      
         RPC_C_IMP_LEVEL_IMPERSONATE, 
         NULL,                        
-        EOAC_DYNAMIC_CLOAKING                   
+        EOAC_NONE                   
     );
 
     if (FAILED(hres))
@@ -223,6 +226,7 @@ extern "C" void go(char* argc, int len)
         
         // Uninitialize OLE environment
         OLE32$CoUninitialize();
+        return;
     }
     else
     {
@@ -236,7 +240,7 @@ extern "C" void go(char* argc, int len)
         dumpFormatAllocation(&fpObject);
         dumpFormatAllocation(&fpExclusionObject);
 
-        BeaconPrintf(CALLBACK_ERROR, "[%02hu] SysAllocString for \"%S\" has failed.", step, WQL);
+        BeaconPrintf(CALLBACK_ERROR, "[%02hu] SysAllocString for \"%S\" has failed.", step, DEFENDER_WQL);
 
         // Free allocated strings
         OLEAUT32$SysFreeString(bstrWQL);
@@ -255,7 +259,7 @@ extern "C" void go(char* argc, int len)
         
         // Uninitialize OLE environment
         OLE32$CoUninitialize();
-
+        return;
     }
     else
     {
@@ -263,14 +267,13 @@ extern "C" void go(char* argc, int len)
         step++;
     }
 
+    // Execute WMI query
     hres = pSvc->ExecQuery(
         bstrWQL,
         bstrQuery,
         WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
         NULL,
         &pEnumerator);
-    
-    ///////////////////////////////////////////////////////
     
     if (FAILED(hres))
     {
@@ -318,10 +321,9 @@ extern "C" void go(char* argc, int len)
         step++;
     }
 
-    /// Next Up ///
+    // Process query results
     IWbemClassObject* pclsObj = NULL;
     ULONG uReturn = 0;
-    
     unsigned long ulIndex = 0;
 
     while (pEnumerator)
@@ -334,83 +336,99 @@ extern "C" void go(char* argc, int len)
         }
 
         VARIANT vtProp;
-        hr = pclsObj->Get(options[iEnumerationOption - 1], 0, &vtProp, 0, 0);
-        BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tProperty retrieved\n", step);
-        step++;
+        OLEAUT32$VariantInit(&vtProp);
+        
+        // Make sure we're using a valid option index
+        if (iEnumerationOption >= 1 && iEnumerationOption <= 4) {
+            hr = pclsObj->Get(options[iEnumerationOption - 1], 0, &vtProp, 0, 0);
+            BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tProperty retrieved\n", step);
+            step++;
 
-        if (!FAILED(hr))
-        {
-            if (!((vtProp.vt == VT_NULL) || (vtProp.vt == VT_EMPTY)))
+            if (!FAILED(hr))
             {
-                if ((vtProp.vt & VT_ARRAY))
+                if (!((vtProp.vt == VT_NULL) || (vtProp.vt == VT_EMPTY)))
                 {
-                    long lower, upper;
-                    BSTR Element;
-
-                    SAFEARRAY* pSafeArray = vtProp.parray;
-
-                    BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tPointer (0x%p)\n", step, vtProp.parray);
-                    step++;
-
-                    hres = OLEAUT32$SafeArrayGetLBound(pSafeArray, 1, &lower);
-                    if (FAILED(hres))
+                    if ((vtProp.vt & VT_ARRAY))
                     {
-                        // Cleanup regimen, if we access something that isn't t
-                        // this will fail retriving from a null pointer
-                        // In the event of one element, upper and lower bound will be 0.
-                    }
-                    else
-                    {
-                        BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\t%02d lower bound\n", step, lower);
+                        long lower, upper;
+                        BSTR Element;
+
+                        SAFEARRAY* pSafeArray = vtProp.parray;
+
+                        BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tPointer (0x%p)\n", step, vtProp.parray);
                         step++;
-                    }
 
-                    OLEAUT32$SafeArrayGetUBound(pSafeArray, 1, &upper);
-                    if (FAILED(hres))
-                    {
-                        // Cleanup regimen, if we access something that isn't there
-                        // this will fail retriving from a null pointer
-                        // In the event of one element, upper and lower bound will be 0.
-                    }
-                    else
-                    {
-                        BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\t%02d upper bound\n", step, upper);
-                        step++;
-                    }
-                    
-                    for (long i = lower; i <= upper; i++)
-                    {
-                        hres = OLEAUT32$SafeArrayGetElement(pSafeArray, &i, &Element);
-
+                        hres = OLEAUT32$SafeArrayGetLBound(pSafeArray, 1, &lower);
                         if (FAILED(hres))
                         {
-                            break;
+                            BeaconFormatPrintf(&fpObject, "[%02hu] WARNING:\tFailed to get lower bound\n", step);
+                            step++;
                         }
                         else
                         {
-                            ++ulIndex;
-                            BeaconFormatPrintf(&fpExclusionObject, "[%02lu]\t\"%S\"\n", ulIndex, (wchar_t*)Element);
+                            BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\t%02d lower bound\n", step, lower);
+                            step++;
+                        }
+
+                        hres = OLEAUT32$SafeArrayGetUBound(pSafeArray, 1, &upper);
+                        if (FAILED(hres))
+                        {
+                            BeaconFormatPrintf(&fpObject, "[%02hu] WARNING:\tFailed to get upper bound\n", step);
+                            step++;
+                        }
+                        else
+                        {
+                            BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\t%02d upper bound\n", step, upper);
+                            step++;
+                        }
+                        
+                        for (long i = lower; i <= upper; i++)
+                        {
+                            hres = OLEAUT32$SafeArrayGetElement(pSafeArray, &i, &Element);
+
+                            if (FAILED(hres))
+                            {
+                                BeaconFormatPrintf(&fpObject, "[%02hu] WARNING:\tFailed to get array element %ld\n", step, i);
+                                step++;
+                                break;
+                            }
+                            else
+                            {
+                                ++ulIndex;
+                                BeaconFormatPrintf(&fpExclusionObject, "[%02lu]\t\"%S\"\n", ulIndex, (wchar_t*)Element);
+                                OLEAUT32$SysFreeString(Element);
+                            }
                         }
                     }
-
-                    pSafeArray = NULL;
-                    //OLEAUT32$SafeArrayDestroy(pSafeArray);
-                    
+                    else if (vtProp.vt == VT_BSTR) {
+                        // Handle single string value
+                        ++ulIndex;
+                        BeaconFormatPrintf(&fpExclusionObject, "[%02lu]\t\"%S\"\n", ulIndex, vtProp.bstrVal);
+                    }
+                }
+                else {
+                    BeaconFormatPrintf(&fpExclusionObject, "No exclusions found for this category.\n");
                 }
             }
+            
+            OLEAUT32$VariantClear(&vtProp);
+        }
+        else {
+            BeaconFormatPrintf(&fpObject, "[%02hu] ERROR:\tInvalid enumeration option: %d\n", step, iEnumerationOption);
+            step++;
         }
         
-        OLEAUT32$VariantClear(&vtProp);
+        if (pclsObj != NULL) {
+            pclsObj->Release();
+            pclsObj = NULL;
+        }
     }
         
     // Cleanup
-    // ENSURE THESE POINTERS ARE NOT NULL BEFORE RELEASING/FREEING
     if (pEnumerator != NULL)
     {
+        pEnumerator->Release();
         BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tReleased enumerator\n", step);
-        pEnumerator->Reset();
-        pEnumerator = NULL;
-
         step++;
     }
 
@@ -418,7 +436,6 @@ extern "C" void go(char* argc, int len)
     {
         pSvc->Release();
         BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tReleased IWbemServices\n", step);
-
         step++;
     }
 
@@ -426,7 +443,6 @@ extern "C" void go(char* argc, int len)
     {
         pLoc->Release();
         BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tReleased IWbemLocator\n", step);
-
         step++;
     }
 
@@ -434,8 +450,7 @@ extern "C" void go(char* argc, int len)
     BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tUninitialized CoInitialize\n", step);
     step++;
 
-
-    // Ensure we free the binary "string"
+    // Free allocated strings
     OLEAUT32$SysFreeString(bstrQuery);
     BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tFreed SysAllocString: \"%S\"\n", step, DEFENDER_WQL);
     step++;
@@ -448,7 +463,7 @@ extern "C" void go(char* argc, int len)
     BeaconFormatPrintf(&fpObject, "[%02hu] SUCCESS:\tFreed SysAllocString: \"%S\"\n", step, WQLNAMESPACE);
     step++;
 
-    // Free our data string
+    // Output results
     dumpFormatAllocation(&fpObject);
     dumpFormatAllocation(&fpExclusionObject);
 
@@ -457,19 +472,10 @@ extern "C" void go(char* argc, int len)
 #else
 extern "C" void go(char* argc, int len)
 {
-    formatp fpObject;
-    formatp fpExclusionObject;
-    datap   dpParser;
-
-    //BeaconFormatAlloc(&fpObject, 64 * 1024);
-    //BeaconFormatAlloc(&fpExclusionObject, 64 * 1024);
-    //BeaconFormatPrintf(&fpExclusionObject, "Excluded Items:\n");
-
+    datap dpParser;
     BeaconDataParse(&dpParser, argc, len);
-
     int iEnumerationOption = BeaconDataInt(&dpParser);
     BeaconPrintf(CALLBACK_OUTPUT, "Received: %d\n", iEnumerationOption);
-
     return;
 }
 #endif
